@@ -18,7 +18,7 @@ Experimental electronic stethoscope: a MAX9814 microphone module sends an analog
 3. Flash MicroPython if it is not already installed, as described below. Flashing overwrites existing firmware. Back up anything important first.
 4. Run `start.bat`. Connect the ESP32, click **Обновить**, select the COM port and click **Подключить**. Use headphones and start at low volume.
 
-The app is in Russian. Controls: amplification, upper filter frequency, noise gate, optional 50 Hz notch and heart / breathing presets. The plot shows approximately five seconds of filtered sound. The 50 Hz notch and aggressive noise gate can also remove useful sounds. This prototype does not record WAV or detect anomalies.
+The app is in Russian. Controls: amplification, upper filter frequency, noise gate, optional 50 Hz notch and heart / breathing presets. The plot shows approximately five seconds of filtered sound. The 50 Hz notch and aggressive noise gate can also remove useful sounds. The app can save and replay raw WAV audio associated with local prototype cards and notes. It does not detect anomalies or determine sinus rhythm. The nominal 4 kHz sampling rate is not hardware-timed or validated.
 
 Alternatively, run `python -m venv .venv`, `.venv\Scripts\python -m pip install -r requirements.txt`, then `.venv\Scripts\python stetho.py`. On non-Windows systems install Python/Tk and PortAudio, create a virtual environment, install the same dependencies and run `python stetho.py`; these platforms have not been tested.
 
@@ -46,3 +46,7 @@ MicroPython is distributed under the [MIT license](https://github.com/micropytho
 - If no port appears, reconnect the board, install the appropriate USB driver and press **Обновить**. If COM is busy, close serial monitors. If the ESP32 fails to respond, press its EN/RST button and retry.
 - Compare quiet surroundings, firmly held tubing and different filter settings. Avoid interpreting this as a calibrated diagnostic recording.
 - Do not upload personal recordings or full board flash backups to a public repository.
+
+## Prototype cards and recordings
+
+Open **Карточки и записи**, create and save a card, connect the ESP32 and select **Начать запись**. Stop recording before disconnecting. To replay, disconnect the live stream, select a recording and press **Прослушать выбранную**. WAV files and the SQLite database are stored locally under `%LOCALAPPDATA%/PheScan` on Windows. They are unencrypted and have no access control or backup: use fictional data only; this prototype is not suitable for real patient records. Do not commit or upload this folder.

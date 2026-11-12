@@ -1,4 +1,7 @@
 import time, threading, queue, tkinter as tk
+import sqlite3, wave, os, uuid
+from pathlib import Path
+from tkinter import messagebox
 from tkinter import ttk
 from collections import deque
 import numpy as np
@@ -14,9 +17,9 @@ CODE='''import machine,time,sys\na=machine.ADC(machine.Pin(34))\na.atten(machine
 class App:
  def __init__(self,root):
   self.root=root;root.title('Stetho • живой звук');root.geometry('1060x740');root.minsize(860,680);root.configure(bg=BG)
-  self.running=False;self.ser=None;self.q=queue.Queue(maxsize=8);self.wave=deque(maxlen=5000);self.threads=[];self.generation=0;self.last_data=0
+  self.record_lock=threading.Lock();self.record_file=None;self.record_patient=None;self.running=False;self.ser=None;self.q=queue.Queue(maxsize=8);self.wave=deque(maxlen=5000);self.threads=[];self.generation=0;self.last_data=0
   self.params={'gain':2.,'cut':500,'gate':0.,'notch':False};self.port=tk.StringVar();self.state=tk.StringVar(value='Не подключено');self.detail=tk.StringVar(value='Подключи ESP32 по USB и выбери порт');self.gainvar=tk.DoubleVar(value=2);self.cutvar=tk.DoubleVar(value=500);self.gatevar=tk.DoubleVar(value=0);self.notchvar=tk.BooleanVar(value=False)
-  self.build();self.refresh_ports();root.protocol('WM_DELETE_WINDOW',self.close);root.after(100,self.draw)
+  self.init_store();self.build();self.refresh_ports();root.protocol('WM_DELETE_WINDOW',self.close);root.after(100,self.draw)
  def label(self,parent,text,**kw):
   return tk.Label(parent,text=text,bg=kw.pop('bg',PANEL),fg=kw.pop('fg',TEXT),font=kw.pop('font',('Segoe UI',10)),**kw)
  def button(self,parent,text,cmd,primary=False):
@@ -33,6 +36,7 @@ class App:
   self.label(conn,'ПОРТ УСТРОЙСТВА',fg=MUTED,font=('Segoe UI',9,'bold')).pack(side='left',padx=(0,12))
   self.combo=ttk.Combobox(conn,textvariable=self.port,state='readonly',width=14);self.combo.pack(side='left')
   self.button(conn,'Обновить',self.refresh_ports).pack(side='left',padx=8)
+  self.button(conn,'Карточки и записи',self.open_records).pack(side='left',padx=8)
   self.connect_btn=self.button(conn,'Подключить',self.connect,True);self.connect_btn.pack(side='right')
   graph=tk.Frame(shell,bg=PANEL,padx=18,pady=15);graph.pack(fill='both',expand=True)
   gh=tk.Frame(graph,bg=PANEL);gh.pack(fill='x');self.label(gh,'Звуковая волна',font=('Segoe UI',12,'bold')).pack(side='left');self.label(gh,'ПОСЛЕДНИЕ 5 СЕКУНД',fg=MUTED,font=('Segoe UI',9,'bold')).pack(side='right')
@@ -44,6 +48,76 @@ class App:
   checks=tk.Frame(controls,bg=PANEL);checks.pack(fill='x',pady=(3,0));tk.Checkbutton(checks,text='Убрать гул 50 Гц',variable=self.notchvar,command=self.changed,bg=PANEL,fg=TEXT,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=('Segoe UI',10)).pack(side='left')
   self.label(checks,'Сильное подавление может скрыть тихие звуки',fg=MUTED,font=('Segoe UI',9)).pack(side='right')
   self.label(shell,'Учебный инструмент: график показывает звук, а не ЭКГ.',bg=BG,fg=MUTED,font=('Segoe UI',9)).pack(anchor='w',pady=(10,0))
+ def init_store(self):
+  self.data_dir=Path(os.environ.get('LOCALAPPDATA',str(Path.home()))) / 'PheScan'
+  self.data_dir.mkdir(parents=True,exist_ok=True)
+  self.db=sqlite3.connect(self.data_dir/'records.sqlite3')
+  self.db.executescript("CREATE TABLE IF NOT EXISTS patients(id INTEGER PRIMARY KEY, name TEXT NOT NULL, notes TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS recordings(id INTEGER PRIMARY KEY, patient_id INTEGER NOT NULL, filename TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")
+  self.db.commit()
+ def open_records(self):
+  if hasattr(self,'records_window') and self.records_window.winfo_exists():self.records_window.lift();return
+  w=tk.Toplevel(self.root);self.records_window=w;w.title('Карточки и записи');w.geometry('760x640');w.configure(bg=BG)
+  self.label(w,'Карточки и записи',bg=BG,font=('Segoe UI',17,'bold')).pack(anchor='w',padx=20,pady=12)
+  self.label(w,'Локальный прототип • не используйте реальные данные пациентов',bg=BG,fg=MUTED).pack(anchor='w',padx=20)
+  f=tk.Frame(w,bg=BG);f.pack(fill='x',padx=20,pady=10)
+  self.patient_list=ttk.Combobox(f,state='readonly',width=35);self.patient_list.pack(side='left');self.patient_list.bind('<<ComboboxSelected>>',lambda e:self.select_patient())
+  self.button(f,'Новая карточка',self.new_patient).pack(side='left',padx=8)
+  self.label(w,'Имя или код',bg=BG).pack(anchor='w',padx=20)
+  self.patient_name=tk.Entry(w,font=('Segoe UI',11));self.patient_name.pack(fill='x',padx=20,pady=4)
+  self.label(w,'Заметки',bg=BG).pack(anchor='w',padx=20)
+  self.notes=tk.Text(w,height=5,font=('Segoe UI',10));self.notes.pack(fill='x',padx=20,pady=4)
+  f=tk.Frame(w,bg=BG);f.pack(fill='x',padx=20,pady=6)
+  self.button(f,'Сохранить карточку',self.save_patient).pack(side='left')
+  self.rec_button=self.button(f,'Начать запись',self.toggle_record,True);self.rec_button.pack(side='left',padx=8)
+  self.label(w,'Записи выбранной карточки',bg=BG).pack(anchor='w',padx=20,pady=(8,0))
+  self.recordings=tk.Listbox(w,height=6);self.recordings.pack(fill='both',expand=True,padx=20,pady=5)
+  f=tk.Frame(w,bg=BG);f.pack(fill='x',padx=20,pady=8)
+  self.button(f,'Прослушать выбранную',self.play_recording).pack(side='left')
+  self.button(f,'Остановить воспроизведение',sd.stop).pack(side='left',padx=8)
+  self.label(w,'Для прослушивания записи отключите живой звук. Запись — сырой сигнал до фильтров.',bg=BG,fg=MUTED,wraplength=700).pack(padx=20,pady=8)
+  self.patient_id=None;self.load_patients()
+ def load_patients(self):
+  self.patient_rows=self.db.execute('SELECT id,name FROM patients ORDER BY id DESC').fetchall();self.patient_list['values']=[f'{i} · {name}' for i,name in self.patient_rows]
+ def new_patient(self):
+  self.patient_id=None;self.patient_list.set('');self.patient_name.delete(0,'end');self.notes.delete('1.0','end');self.recordings.delete(0,'end')
+ def select_patient(self):
+  idx=self.patient_list.current()
+  if idx<0:return
+  self.patient_id=self.patient_rows[idx][0];row=self.db.execute('SELECT name,notes FROM patients WHERE id=?',(self.patient_id,)).fetchone();self.patient_name.delete(0,'end');self.patient_name.insert(0,row[0]);self.notes.delete('1.0','end');self.notes.insert('1.0',row[1]);self.load_recordings()
+ def save_patient(self):
+  name=self.patient_name.get().strip();notes=self.notes.get('1.0','end-1c')
+  if not name:messagebox.showerror('Карточка','Укажите имя или код.');return
+  if self.patient_id:self.db.execute('UPDATE patients SET name=?,notes=? WHERE id=?',(name,notes,self.patient_id))
+  else:self.patient_id=self.db.execute('INSERT INTO patients(name,notes) VALUES (?,?)',(name,notes)).lastrowid
+  self.db.commit();self.load_patients();self.patient_list.current(next(i for i,r in enumerate(self.patient_rows) if r[0]==self.patient_id));self.load_recordings()
+ def load_recordings(self):
+  self.recordings.delete(0,'end');self.record_rows=self.db.execute('SELECT id,filename,created FROM recordings WHERE patient_id=? ORDER BY id DESC',(self.patient_id,)).fetchall() if self.patient_id else []
+  for _,_,created in self.record_rows:self.recordings.insert('end',created+' UTC')
+ def toggle_record(self):
+  if self.record_file is not None:self.stop_recording();return
+  if not self.running or not self.last_data:messagebox.showerror('Запись','Сначала подключите плату и дождитесь сигнала.');return
+  if not self.patient_id:messagebox.showerror('Запись','Сначала сохраните карточку.');return
+  filename=uuid.uuid4().hex+'.wav';path=self.data_dir/filename
+  try:
+   f=wave.open(str(path),'wb');f.setnchannels(1);f.setsampwidth(2);f.setframerate(RATE)
+   with self.record_lock:self.record_file=f;self.record_patient=(self.patient_id,filename)
+   self.rec_button.configure(text='Остановить запись');self.detail.set('Идёт запись сырого сигнала')
+  except OSError as e:messagebox.showerror('Запись',str(e))
+ def stop_recording(self):
+  with self.record_lock:
+   if self.record_file is None:return
+   f=self.record_file;patient=self.record_patient;self.record_file=None;self.record_patient=None;f.close()
+  self.db.execute('INSERT INTO recordings(patient_id,filename) VALUES (?,?)',patient);self.db.commit()
+  if hasattr(self,'records_window') and self.records_window.winfo_exists():self.rec_button.configure(text='Начать запись');self.load_recordings()
+ def play_recording(self):
+  if self.running:messagebox.showinfo('Прослушивание','Сначала отключите живой звук кнопкой «Отключить».');return
+  selection=self.recordings.curselection()
+  if not selection:return
+  path=self.data_dir/self.record_rows[selection[0]][1]
+  try:
+   with wave.open(str(path),'rb') as f:data=np.frombuffer(f.readframes(f.getnframes()),dtype='<i2').astype(np.float32)/32768
+   sd.play(data,RATE)
+  except Exception as e:messagebox.showerror('Прослушивание',str(e))
  def slider(self,parent,title,var,lo,hi,step,key,col):
   parent.grid_columnconfigure(col,weight=1,uniform='c');f=tk.Frame(parent,bg=PANEL);f.grid(row=0,column=col,sticky='ew',padx=(0,16));self.label(f,title,fg=MUTED,font=('Segoe UI',9)).pack(anchor='w')
   tk.Scale(f,variable=var,from_=lo,to=hi,resolution=step,orient='horizontal',showvalue=True,command=lambda _:self.changed(),bg=PANEL,fg=TEXT,highlightthickness=0,troughcolor=EDGE,activebackground=TEAL,sliderrelief='flat',font=('Segoe UI',9)).pack(fill='x')
@@ -65,7 +139,7 @@ class App:
   if not self.port.get():self.refresh_ports();self.detail.set('Сначала подключи ESP32 и выбери COM-порт.');return
   self.running=True;self.generation+=1;gen=self.generation;self.wave.clear();self.q=queue.Queue(maxsize=8);self.last_data=0;self.state.set('Подключение');self.detail.set('Запускаем передачу с ESP32…');self.connect_btn.configure(text='Отключить');threading.Thread(target=self.worker,args=(gen,self.port.get()),daemon=True).start()
  def disconnect(self):
-  self.running=False;self.generation+=1
+  self.stop_recording();self.running=False;self.generation+=1
   if self.ser:
    try:self.ser.write(b'\x03');self.ser.close()
    except Exception:pass
@@ -94,7 +168,10 @@ class App:
      if settings[1]:
       bn,an=signal.iirnotch(50,12,fs=RATE);sos=np.vstack((sos,signal.tf2sos(bn,an)))
      zi=signal.sosfilt_zi(sos)*((b[0]-128)/128);last=settings
-    x=(np.frombuffer(b,dtype=np.uint8).astype(np.float32)-128)/128;y,zi=signal.sosfilt(sos,x,zi=zi)
+    x=(np.frombuffer(b,dtype=np.uint8).astype(np.float32)-128)/128
+    with self.record_lock:
+     if self.record_file is not None:self.record_file.writeframesraw((x*32767).astype('<i2').tobytes())
+    y,zi=signal.sosfilt(sos,x,zi=zi)
     level=float(np.sqrt(np.mean(y*y)));target=1. if p['gate']<=0 else .12+.88*min(1.,(level/p['gate'])**2);gate_gain+=.18*(target-gate_gain)
     out=np.clip(y*p['gain']*gate_gain,-.75,.75).astype(np.float32);self.wave.extend(out[::4].tolist())
     try:self.q.put_nowait(out)
@@ -125,7 +202,7 @@ class App:
    c.create_line(*pts,fill=TEAL,width=1.3)
   if self.running and self.last_data and time.monotonic()-self.last_data>3:self.detail.set('Нет данных с платы. Проверь подключение и попробуй переподключиться.')
   self.root.after(100,self.draw)
- def close(self):self.disconnect();self.root.destroy()
+ def close(self):self.disconnect();sd.stop();self.db.close();self.root.destroy()
 
 if __name__=='__main__':
  root=tk.Tk();App(root);root.mainloop()
